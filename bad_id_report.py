@@ -16,8 +16,11 @@ What it does
        Q116   - SD = 0
    Total_StraighLiner = the number of grids flagged.
 3. Flags speeders (low LOI), high LOI, junk open ends, and duplicate IPs.
-4. Drops any ID that was already reported in an earlier round.
-5. Writes the report sheet with the client's columns and highlighting.
+4. Carries forward every ID reported in earlier rounds, so the report stays
+   cumulative. IDs new to this round are marked red on sys_RespNum and psid.
+5. Stamps each row with the date it was first reported, so counts can be
+   pulled by round.
+6. Writes the report sheet with the client's columns and highlighting.
 
 Usage
 -----
@@ -31,6 +34,7 @@ Dependencies: pandas, numpy, openpyxl
 import os
 import re
 import collections
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -42,8 +46,15 @@ from openpyxl.utils import get_column_letter
 # ============================== CONFIG ======================================
 
 DATA_FILE = "KESHO014_data__2_.csv"          # raw data (.csv or .xlsx)
-PREV_REPORT = "KESHO014_ZEISS_US_Regimen_Claims_Validation_Research_Data_Reports_16092026.xlsx"
+# Reports already sent, with the date each one went out. Rows are carried
+# forward as originally sent. If a file already has a "Reported Date" column,
+# that is used instead of the date given here.
+PREV_REPORTS = {
+    "KESHO014_ZEISS_US_Regimen_Claims_Validation_Research_Data_Reports_16092026.xlsx":
+        dt.date(2026, 9, 16),
+}
 PREV_SHEET = "Data Reports"
+THIS_DATE = dt.date.today()          # date this round is reported
 OUT_FILE = "KESHO014_Bad_IDs_Report.xlsx"
 
 ID_COL = "sys_RespNum"
@@ -86,20 +97,38 @@ def load_data(path):
     return pd.read_csv(path, dtype=str, low_memory=False)
 
 
-def load_previous(path, sheet):
-    """Return {resp_id: factor} for every ID reported in an earlier round."""
-    if not path or not os.path.exists(path):
-        print("No previous report found - nothing will be excluded.")
-        return {}
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[sheet]
-    head = [c.value for c in ws[1]]
-    i_id, i_fac = head.index("sys_RespNum"), head.index("Factor")
-    prev = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[i_fac]:
-            prev[str(row[i_id])] = row[i_fac]
-    return prev
+def load_previous(reports, sheet):
+    """Rows from every earlier report, exactly as they were sent.
+
+    Returns a list of dicts (one per reported ID) carrying a _date key.
+    """
+    carried = []
+    for path, sent in (reports or {}).items():
+        if not os.path.exists(path):
+            print(f"  ! not found, skipped: {path}")
+            continue
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+        head = [c.value for c in ws[1]]
+        if "Factor" not in head:
+            print(f"  ! no Factor column, skipped: {path}")
+            continue
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            rec = dict(zip(head, row))
+            if not rec.get("Factor"):
+                continue
+            d = rec.get("Reported Date") or sent
+            rec["_date"] = d.date() if isinstance(d, dt.datetime) else d
+            carried.append(rec)
+    seen, out = set(), []
+    for rec in carried:                      # keep the earliest sighting of an ID
+        rid = str(rec.get("sys_RespNum"))
+        if rid in seen:
+            continue
+        seen.add(rid)
+        out.append(rec)
+    return out
+
 
 # ============================== CHECKS ======================================
 
@@ -186,10 +215,16 @@ def build_factor(row, junk_ids, dup_ids):
     return " + ".join(sorted(parts, key=FACTOR_ORDER.index))
 
 
-def write_report(bad, path):
-    grid_cols = [c for spec in GRIDS.values() for c in spec["cols"]]
-    head = [ID_COL, PSID_COL, "Factor", "Total_StraighLiner", IP_COL,
-            f"LOI ({SPEEDER_MINS} Mins)", OE_COL] + grid_cols
+def write_report(rows, grids, cfg, path):
+    """Build the client workbook.
+
+    rows is a list of {"id", "new", "src", "rec"}, where rec is either a
+    carried-forward dict from an earlier report or a row of the current data.
+    """
+    grid_cols = [c for cols in grids.values() for c in cols]
+    loi_head = f"LOI ({cfg['speeder']} Mins)"
+    head = [cfg["id_col"], cfg["psid_col"], "Factor", "Reported Date",
+            "Total_StraighLiner", cfg["ip_col"], loi_head, cfg["oe_col"]] + grid_cols
     col = {h: i + 1 for i, h in enumerate(head)}
 
     wb = openpyxl.Workbook()
@@ -203,63 +238,109 @@ def write_report(bad, path):
     bd = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     hfill = PatternFill("solid", start_color="D9E1F2")
-    yellow = PatternFill("solid", start_color="FFFF00")            # straightlined cells
+    yellow = PatternFill("solid", start_color="FFFF00")     # straightlined cells
+    red = PatternFill("solid", start_color="FF0000")        # new this round
     tint = 0.7999816888943144
-    oe_fill = PatternFill("solid", fgColor=Color(theme=4, tint=tint))   # light blue
-    loi_fill = PatternFill("solid", fgColor=Color(theme=5, tint=tint))  # light red
-    ip_fill = PatternFill("solid", start_color="E2EFDA")                # light green
+    oe_fill = PatternFill("solid", fgColor=Color(theme=4, tint=tint))
+    loi_fill = PatternFill("solid", fgColor=Color(theme=5, tint=tint))
+    ip_fill = PatternFill("solid", start_color="E2EFDA")
 
     for j, h in enumerate(head, 1):
         c = ws.cell(row=1, column=j, value=h)
         c.font, c.alignment, c.fill, c.border = hf, cen, hfill, bd
 
-    for i, (_, r) in enumerate(bad.iterrows(), 2):
-        vals = [int(r.RespNum), r[PSID_COL], r.Factor, int(r.SL_count), r[IP_COL],
-                round(float(r.LOI), 2),
-                None if pd.isna(r[OE_COL]) else str(r[OE_COL])]
-        for c_ in grid_cols:
-            v = r[c_] if c_ in bad.columns else None
-            if pd.isna(v):
-                vals.append(None)
-            else:
-                try:
-                    vals.append(int(v))
-                except (TypeError, ValueError):
-                    vals.append(str(v))
+    def as_cell(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    for i, item in enumerate(rows, 2):
+        r = item["rec"]
+        if item["src"] == "prev":
+            vals = [r["_date"] if h == "Reported Date" else r.get(h) for h in head]
+            sl_count = r.get("Total_StraighLiner") or 0
+            factor_txt = r.get("Factor") or ""
+            sl_which = [g for g, cols in grids.items()
+                        if len([r.get(c) for c in cols if r.get(c) not in (None, "")]) >= 5
+                        and len({r.get(c) for c in cols if r.get(c) not in (None, "")}) == 1]
+        else:
+            vals = [r["RespNum"], r.get(cfg["psid_col"]), r["Factor"], cfg["this_date"],
+                    int(r["SL_count"]), r.get(cfg["ip_col"]),
+                    None if pd.isna(r["LOI"]) else round(float(r["LOI"]), 2),
+                    None if pd.isna(r.get(cfg["oe_col"])) else str(r.get(cfg["oe_col"]))]
+            vals += [r.get(c) for c in grid_cols]
+            sl_count = int(r["SL_count"])
+            factor_txt = r["Factor"]
+            sl_which = [x for x in str(r["SL_which"]).split("; ") if x]
+
         for j, v in enumerate(vals, 1):
-            c = ws.cell(row=i, column=j, value=v)
+            if j == col[loi_head] and v is not None:
+                v = round(float(v), 2)
+            keep = j in (col["Factor"], col["Reported Date"], col[loi_head])
+            c = ws.cell(row=i, column=j, value=v if keep else as_cell(v))
             c.font, c.alignment, c.border = bf, cen, bd
-            if j == col[f"LOI ({SPEEDER_MINS} Mins)"]:
+            if j == col["Reported Date"]:
+                c.number_format = "DD-MMM-YYYY"
+            if j == col[loi_head]:
                 c.number_format = "0.00"
 
-        # highlight only what the ID is actually reported for
-        if r.SL_count >= SL_MIN:
-            for g in [x for x in str(r.SL_which).split("; ") if x]:
-                for c_ in GRIDS[g]["cols"]:
-                    ws.cell(row=i, column=col[c_]).fill = yellow
-        if "Junk OE" in r.Factor:
-            ws.cell(row=i, column=col[OE_COL]).fill = oe_fill
-        if "LOI" in r.Factor:
-            ws.cell(row=i, column=col[f"LOI ({SPEEDER_MINS} Mins)"]).fill = loi_fill
-        if "Duplicate IP" in r.Factor:
-            ws.cell(row=i, column=col[IP_COL]).fill = ip_fill
+        if sl_count and "Straight Liner" in factor_txt:
+            for g in sl_which:
+                for c_ in grids.get(g, []):
+                    if c_ in col:
+                        ws.cell(row=i, column=col[c_]).fill = yellow
+        if "Junk OE" in factor_txt and cfg["oe_col"] in col:
+            ws.cell(row=i, column=col[cfg["oe_col"]]).fill = oe_fill
+        if "LOI" in factor_txt:
+            ws.cell(row=i, column=col[loi_head]).fill = loi_fill
+        if "Duplicate IP" in factor_txt and cfg["ip_col"] in col:
+            ws.cell(row=i, column=col[cfg["ip_col"]]).fill = ip_fill
 
-    for k, w in {"A": 15.8, "B": 33.5, "C": 26, "D": 19.3,
-                 "E": 34.2, "F": 16.7, "G": 96.3}.items():
+        if item["new"]:                      # red on the ID columns
+            for h in (cfg["id_col"], cfg["psid_col"]):
+                if h not in col:
+                    continue
+                c = ws.cell(row=i, column=col[h])
+                c.fill = red
+                c.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+
+    for k, w in {"A": 15.8, "B": 33.5, "C": 26, "D": 15,
+                 "E": 19.3, "F": 34.2, "G": 16.7, "H": 96.3}.items():
         ws.column_dimensions[k].width = w
-    for j in range(8, len(head) + 1):
+    for j in range(9, len(head) + 1):
         ws.column_dimensions[get_column_letter(j)].width = 10.5
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "C2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(head))}{len(bad) + 1}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(head))}{len(rows) + 1}"
+
+    # by-date summary
+    ws2 = wb.create_sheet("By Date")
+    tally = collections.Counter(
+        (r["rec"]["_date"] if r["src"] == "prev" else cfg["this_date"]) for r in rows)
+    for j, h in enumerate(["Reported Date", "Bad IDs", "Cumulative"], 1):
+        c = ws2.cell(row=1, column=j, value=h)
+        c.font = hf
+    run = 0
+    for i, (d, n) in enumerate(sorted(tally.items()), 2):
+        run += n
+        ws2.cell(row=i, column=1, value=d).number_format = "DD-MMM-YYYY"
+        ws2.cell(row=i, column=2, value=n)
+        ws2.cell(row=i, column=3, value=run)
+        for j in range(1, 4):
+            ws2.cell(row=i, column=j).font = bf
+    for k, w in {"A": 16, "B": 12, "C": 12}.items():
+        ws2.column_dimensions[k].width = w
+
     wb.save(path)
 
 
 def main():
     df = load_data(DATA_FILE)
-    df["RespNum"] = df[ID_COL].astype(str)
+    df["RespNum"] = df[ID_COL].astype(str).str.strip()
     df["LOI"] = pd.to_numeric(df[TIME_COL], errors="coerce") / 60.0
-
     df["SL_count"], df["SL_which"] = straightliner_flags(df)
 
     # junk open ends
@@ -269,57 +350,62 @@ def main():
         if reason:
             junk[df.at[idx, "RespNum"]] = (str(v).strip(), reason)
     for i in OE_FORCE:
-        junk.setdefault(str(i), ("", "manually added"))
+        junk.setdefault(str(i), ("", "added by hand"))
     for i in OE_EXCLUDE:
         junk.pop(str(i), None)
 
     dup = duplicate_ips(df) if CHECK_DUP_IP else {}
 
-    prev = load_previous(PREV_REPORT, PREV_SHEET)
-    new = df[~df.RespNum.isin(prev)].copy()
-    new["Factor"] = new.apply(lambda r: build_factor(r, junk, dup), axis=1)
+    carried = load_previous(PREV_REPORTS, PREV_SHEET)
+    prev_ids = {str(r.get("sys_RespNum")) for r in carried}
 
-    bad = new[new.Factor != ""].copy()
-    bad["_sort"] = pd.to_numeric(bad.RespNum, errors="coerce")
-    bad = bad.sort_values("_sort")
+    fresh = df[~df.RespNum.isin(prev_ids)].copy()
+    fresh["Factor"] = fresh.apply(lambda r: build_factor(r, junk, dup), axis=1)
+    fresh = fresh[fresh.Factor != ""]
 
-    write_report(bad, OUT_FILE)
+    rows = [{"id": str(r.get("sys_RespNum")), "new": False, "src": "prev", "rec": r}
+            for r in carried]
+    rows += [{"id": r["RespNum"], "new": True, "src": "new", "rec": r}
+             for _, r in fresh.iterrows()]
+    rows.sort(key=lambda x: int(x["id"]) if str(x["id"]).isdigit() else 0)
 
-    print(f"Records in data file      : {len(df)}")
-    print(f"Reported earlier (skipped): {len(prev)}")
-    print(f"Reviewed this round       : {len(new)}")
-    print(f"Bad IDs reported          : {len(bad)}")
-    print(f"Median LOI                : {df.LOI.median():.2f} mins")
+    cfg = {"id_col": ID_COL, "psid_col": PSID_COL, "ip_col": IP_COL, "oe_col": OE_COL,
+           "sl_min": SL_MIN, "speeder": SPEEDER_MINS, "this_date": THIS_DATE}
+    write_report(rows, {g: spec["cols"] for g, spec in GRIDS.items()}, cfg, OUT_FILE)
+
+    print(f"Records in data file   : {len(df)}")
+    print(f"Carried forward        : {len(carried)}")
+    print(f"New this round (in red): {len(fresh)}")
+    print(f"Rows in report         : {len(rows)}")
+    print(f"Median LOI             : {df.LOI.median():.2f} mins")
     print()
-    print("  Straight Liner :", int((bad.SL_count >= SL_MIN).sum()))
-    print("  LOI (speeders) :", int((bad.LOI < SPEEDER_MINS).sum()))
+    print("  Straight Liner :", int((fresh.SL_count >= SL_MIN).sum()))
+    print("  LOI (speeders) :", int((fresh.LOI < SPEEDER_MINS).sum()))
     if HIGH_LOI_MINS:
-        print("  High LOI       :", int((bad.LOI > HIGH_LOI_MINS).sum()))
-    print("  Junk OE        :", sum(1 for i in bad.RespNum if i in junk))
-    print("  Duplicate IP   :", sum(1 for i in bad.RespNum if i in dup))
+        print("  High LOI       :", int((fresh.LOI > HIGH_LOI_MINS).sum()))
+    print("  Junk OE        :", sum(1 for i in fresh.RespNum if i in junk))
+    print("  Duplicate IP   :", sum(1 for i in fresh.RespNum if i in dup))
     print()
     print("Junk OE detected (check these by eye before sending):")
     for rid, (txt, why) in junk.items():
-        mark = "reported" if rid in set(bad.RespNum) else "already reported earlier"
-        print(f"   {rid:>6}  {why:<22} \"{txt[:45]}\"  [{mark}]")
+        where = "new" if rid in set(fresh.RespNum) else "reported earlier"
+        print(f"   {rid:>6}  {why:<22} \"{txt[:45]}\"  [{where}]")
     print()
     print("Borderline, not reported:")
-    edge = new[(new.SL_count == SL_MIN - 1) & (new.Factor == "")]
+    edge = fresh_edge = df[(~df.RespNum.isin(prev_ids)) & (df.SL_count == SL_MIN - 1)
+                           & (~df.RespNum.isin(set(fresh.RespNum)))]
     print(f"   {len(edge)} IDs with exactly {SL_MIN - 1} straightlined grid(s): "
           + ", ".join(sorted(edge.RespNum, key=int)))
-    band = new[(new.LOI >= SPEEDER_MINS) & (new.LOI < df.LOI.median() / 2) & (new.Factor == "")]
-    print(f"   {len(band)} IDs between {SPEEDER_MINS} mins and half the median LOI")
     print()
     print("Saved:", OUT_FILE)
 
-    # IDs formatted for pasting into the .sps IF (any(sys_RespNum, ...)) lines
     def sps(ids):
         return ", ".join(sorted((str(i) for i in ids), key=int))
     print()
-    print("For the syntax:")
-    print("  FlagLOI       :", sps(bad.loc[bad.LOI < SPEEDER_MINS, "RespNum"]))
-    print("  FlagQ115      :", sps([i for i in bad.RespNum if i in junk]))
-    print("  Dup_IPAddress :", sps([i for i in bad.RespNum if i in dup]))
+    print("For the syntax (new IDs only):")
+    print("  FlagLOI       :", sps(fresh.loc[fresh.LOI < SPEEDER_MINS, "RespNum"]))
+    print("  FlagQ115      :", sps([i for i in fresh.RespNum if i in junk]))
+    print("  Dup_IPAddress :", sps([i for i in fresh.RespNum if i in dup]))
 
 
 if __name__ == "__main__":

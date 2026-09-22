@@ -35,8 +35,9 @@ Uploads live in memory for the session only and are not written to disk.
 ## Using the app
 
 1. **Files** - upload the raw data (.csv or .xlsx), and the earlier report(s)
-   whose IDs should be excluded. Any workbook with `sys_RespNum` and `Factor`
-   columns works, and several can be uploaded at once.
+   to carry forward. Any workbook with `sys_RespNum` and `Factor` columns
+   works, and several can be uploaded at once. Set the date each one was sent
+   (guessed from a ddmmyyyy filename) and the date for this round.
 2. **Columns** - the ID, panel ID, IP, timing and open-end columns are
    pre-selected by name where possible; change them if the layout differs.
 3. **Criteria** - straightliner threshold, speeder cut-off, High LOI on or off,
@@ -51,6 +52,13 @@ Uploads live in memory for the session only and are not written to disk.
 6. **Download** the workbook, and copy the ready-made `IF (any(sys_RespNum,
    ...))` lines into the SPSS syntax.
 
+## Cumulative reporting
+
+IDs from earlier rounds are **not** dropped. Their rows are carried forward
+exactly as they were sent, and the IDs new to this round are marked red on
+`sys_RespNum` and `psid`. Every row carries a **Reported Date**, and a
+**By Date** tab totals the bad IDs per round with a running cumulative count.
+
 ## Straightliner rule
 
 Matches `KESHO014_Data_Reports_Syntax.sps`: a grid counts when at least the
@@ -60,6 +68,7 @@ the 16 Sep report reproduces all 520 of its `Total_StraighLiner` values.
 
 ## Highlighting
 
-Yellow on the straightlined grid cells, light blue on a junk Q115, light red on
-an LOI outside the thresholds, light green on a duplicate IP - the first three
+Red on `sys_RespNum` and `psid` for IDs new this round, yellow on the
+straightlined grid cells, light blue on a junk Q115, light red on an LOI
+outside the thresholds, light green on a duplicate IP. All but the last are
 taken from the colours in the client report.

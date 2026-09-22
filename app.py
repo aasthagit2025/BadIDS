@@ -4,8 +4,8 @@ Bad ID Report - Streamlit app
 
 Upload the raw data file and (optionally) the reports already sent to the
 client. The app flags straightliners, speeders, junk open ends and duplicate
-IPs, drops anything reported before, and builds the client report workbook
-with the usual highlighting.
+IPs, carries forward everything reported before, and marks the IDs new to this
+round in red. Each row is stamped with the date it was first reported.
 
 Run locally:
     pip install -r requirements.txt
@@ -15,6 +15,7 @@ Run locally:
 import io
 import re
 import collections
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -45,21 +46,32 @@ def read_table(upload):
                        encoding="utf-8", encoding_errors="replace")
 
 
-def read_previous(uploads, id_col="sys_RespNum", factor_col="Factor"):
-    """{resp_id: factor} across every previous report uploaded."""
-    prev = {}
+def read_previous(uploads, dates, id_col="sys_RespNum", factor_col="Factor"):
+    """Rows from every earlier report, exactly as they were sent.
+
+    Returns a list of dicts, each carrying a _date key.
+    """
+    carried, seen = [], set()
     for up in uploads or []:
         wb = openpyxl.load_workbook(io.BytesIO(up.getvalue()), data_only=True)
         for ws in wb.worksheets:
             head = [c.value for c in ws[1]]
             if id_col not in head or factor_col not in head:
                 continue
-            i_id, i_f = head.index(id_col), head.index(factor_col)
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[i_f] not in (None, ""):
-                    prev[str(row[i_id]).strip()] = row[i_f]
+                rec = dict(zip(head, row))
+                if not rec.get(factor_col):
+                    continue
+                rid = str(rec.get(id_col)).strip()
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                d = rec.get("Reported Date") or dates.get(up.name)
+                rec["_date"] = d.date() if isinstance(d, dt.datetime) else d
+                rec["_id"] = rid
+                carried.append(rec)
             break
-    return prev
+    return carried
 
 
 def detect_grids(columns):
@@ -158,12 +170,17 @@ def build_factor(row, junk_ids, dup_ids, sl_min, speeder, high_loi):
     return " + ".join(sorted(parts, key=FACTOR_ORDER.index))
 
 
-def write_report(bad, grids, cfg):
-    """Build the client workbook and return it as bytes."""
-    grid_cols = [c for cols in grids.values() for c in cols if c in bad.columns]
+def write_report(rows, grids, cfg):
+    """Build the client workbook and return it as bytes.
+
+    rows is a list of {"id", "new", "src", "rec"}, where rec is either a
+    carried-forward dict from an earlier report or a row of the current data.
+    """
+    grid_cols = [c for cols in grids.values() for c in cols]
     loi_head = f"LOI ({cfg['speeder']} Mins)"
-    head = [cfg["id_col"], cfg["psid_col"], "Factor", "Total_StraighLiner",
-            cfg["ip_col"], loi_head, cfg["oe_col"]] + grid_cols
+    head = [cfg["id_col"], cfg["psid_col"], "Factor", "Reported Date",
+            "Total_StraighLiner", cfg["ip_col"], loi_head, cfg["oe_col"]] + grid_cols
+    head = [h for h in head if h != "(none)"]
     col = {h: i + 1 for i, h in enumerate(head)}
 
     wb = openpyxl.Workbook()
@@ -178,6 +195,7 @@ def write_report(bad, grids, cfg):
 
     hfill = PatternFill("solid", start_color="D9E1F2")
     yellow = PatternFill("solid", start_color="FFFF00")
+    red = PatternFill("solid", start_color="FF0000")
     tint = 0.7999816888943144
     oe_fill = PatternFill("solid", fgColor=Color(theme=4, tint=tint))
     loi_fill = PatternFill("solid", fgColor=Color(theme=5, tint=tint))
@@ -187,50 +205,97 @@ def write_report(bad, grids, cfg):
         c = ws.cell(row=1, column=j, value=h)
         c.font, c.alignment, c.fill, c.border = hf, cen, hfill, bd
 
-    for i, (_, r) in enumerate(bad.iterrows(), 2):
-        vals = [r["RespNum"], r.get(cfg["psid_col"]), r["Factor"], int(r["SL_count"]),
-                r.get(cfg["ip_col"]),
-                None if pd.isna(r["LOI"]) else round(float(r["LOI"]), 2),
-                None if pd.isna(r.get(cfg["oe_col"])) else str(r.get(cfg["oe_col"]))]
+    def as_cell(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
         try:
-            vals[0] = int(vals[0])
+            return int(v)
         except (TypeError, ValueError):
-            pass
-        for c_ in grid_cols:
-            v = r.get(c_)
-            if pd.isna(v):
-                vals.append(None)
-            else:
-                try:
-                    vals.append(int(v))
-                except (TypeError, ValueError):
-                    vals.append(str(v))
+            return str(v)
+
+    for i, item in enumerate(rows, 2):
+        r = item["rec"]
+        if item["src"] == "prev":
+            vals = [r["_date"] if h == "Reported Date" else r.get(h) for h in head]
+            sl_count = r.get("Total_StraighLiner") or 0
+            factor_txt = r.get("Factor") or ""
+            sl_which = [g for g, cols in grids.items()
+                        if len([r.get(c) for c in cols if r.get(c) not in (None, "")]) >= 5
+                        and len({r.get(c) for c in cols if r.get(c) not in (None, "")}) == 1]
+        else:
+            vals = []
+            for h in head:
+                if h == "Factor":
+                    vals.append(r["Factor"])
+                elif h == "Reported Date":
+                    vals.append(cfg["this_date"])
+                elif h == "Total_StraighLiner":
+                    vals.append(int(r["SL_count"]))
+                elif h == loi_head:
+                    vals.append(None if pd.isna(r["LOI"]) else round(float(r["LOI"]), 2))
+                elif h == cfg["id_col"]:
+                    vals.append(r["RespNum"])
+                else:
+                    vals.append(r.get(h))
+            sl_count = int(r["SL_count"])
+            factor_txt = r["Factor"]
+            sl_which = [x for x in str(r["SL_which"]).split("; ") if x]
+
         for j, v in enumerate(vals, 1):
-            c = ws.cell(row=i, column=j, value=v)
+            if j == col[loi_head] and v is not None:
+                v = round(float(v), 2)
+            keep = j in (col["Factor"], col["Reported Date"], col[loi_head])
+            c = ws.cell(row=i, column=j, value=v if keep else as_cell(v))
             c.font, c.alignment, c.border = bf, cen, bd
+            if j == col["Reported Date"]:
+                c.number_format = "DD-MMM-YYYY"
             if j == col[loi_head]:
                 c.number_format = "0.00"
 
-        if r["SL_count"] >= cfg["sl_min"]:
-            for g in [x for x in str(r["SL_which"]).split("; ") if x]:
+        if sl_count and "Straight Liner" in factor_txt:
+            for g in sl_which:
                 for c_ in grids.get(g, []):
                     if c_ in col:
                         ws.cell(row=i, column=col[c_]).fill = yellow
-        if "Junk OE" in r["Factor"]:
+        if "Junk OE" in factor_txt and cfg["oe_col"] in col:
             ws.cell(row=i, column=col[cfg["oe_col"]]).fill = oe_fill
-        if "LOI" in r["Factor"]:
+        if "LOI" in factor_txt:
             ws.cell(row=i, column=col[loi_head]).fill = loi_fill
-        if "Duplicate IP" in r["Factor"]:
+        if "Duplicate IP" in factor_txt and cfg["ip_col"] in col:
             ws.cell(row=i, column=col[cfg["ip_col"]]).fill = ip_fill
 
-    for k, w in {"A": 15.8, "B": 33.5, "C": 26, "D": 19.3,
-                 "E": 34.2, "F": 16.7, "G": 96.3}.items():
+        if item["new"]:
+            for h in (cfg["id_col"], cfg["psid_col"]):
+                if h not in col:
+                    continue
+                c = ws.cell(row=i, column=col[h])
+                c.fill = red
+                c.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+
+    for k, w in {"A": 15.8, "B": 33.5, "C": 26, "D": 15,
+                 "E": 19.3, "F": 34.2, "G": 16.7, "H": 96.3}.items():
         ws.column_dimensions[k].width = w
-    for j in range(8, len(head) + 1):
+    for j in range(9, len(head) + 1):
         ws.column_dimensions[get_column_letter(j)].width = 10.5
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "C2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(head))}{len(bad) + 1}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(head))}{len(rows) + 1}"
+
+    ws2 = wb.create_sheet("By Date")
+    tally = collections.Counter(
+        (r["rec"]["_date"] if r["src"] == "prev" else cfg["this_date"]) for r in rows)
+    for j, h in enumerate(["Reported Date", "Bad IDs", "Cumulative"], 1):
+        ws2.cell(row=1, column=j, value=h).font = hf
+    run = 0
+    for i, (d, n) in enumerate(sorted(tally.items(), key=lambda x: (x[0] is None, x[0])), 2):
+        run += n
+        ws2.cell(row=i, column=1, value=d).number_format = "DD-MMM-YYYY"
+        ws2.cell(row=i, column=2, value=n)
+        ws2.cell(row=i, column=3, value=run)
+        for j in range(1, 4):
+            ws2.cell(row=i, column=j).font = bf
+    for k, w in {"A": 16, "B": 12, "C": 12}.items():
+        ws2.column_dimensions[k].width = w
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -246,8 +311,16 @@ st.caption("Straightliners, speeders, junk open ends and duplicate IPs, in the "
 with st.sidebar:
     st.header("1. Files")
     data_up = st.file_uploader("Raw data (.csv or .xlsx)", type=["csv", "xlsx", "xlsm"])
-    prev_up = st.file_uploader("Earlier report(s) to exclude", type=["xlsx"],
+    prev_up = st.file_uploader("Earlier report(s) to carry forward", type=["xlsx"],
                                accept_multiple_files=True)
+    this_date = st.date_input("Date for this round", value=dt.date.today())
+    prev_dates = {}
+    for up in prev_up or []:
+        guess = re.search(r"(\d{2})(\d{2})(\d{4})", up.name)
+        default = (dt.date(int(guess.group(3)), int(guess.group(2)), int(guess.group(1)))
+                   if guess else dt.date.today())
+        prev_dates[up.name] = st.date_input(f"Date sent: {up.name[:28]}", value=default,
+                                            key=f"d_{up.name}")
 
 if not data_up:
     st.info("Upload a raw data file in the sidebar to begin.")
@@ -310,8 +383,9 @@ else:
 df["SL_count"], df["SL_which"] = straightliner_flags(df, chosen, min_items)
 
 # ---- previous rounds ----
-prev = read_previous(prev_up, id_col=id_col)
-new = df[~df.RespNum.isin(prev)].copy()
+carried = read_previous(prev_up, prev_dates, id_col=id_col)
+prev_ids = {r["_id"] for r in carried}
+new = df[~df.RespNum.isin(prev_ids)].copy()
 
 # ---- junk OE ----
 junk_auto = {}
@@ -351,7 +425,7 @@ dup = duplicate_ips(new, ip_col) if (check_ip and ip_col != "(none)") else {}
 
 # ---- build ----
 cfg = {"id_col": id_col, "psid_col": psid_col, "ip_col": ip_col, "oe_col": oe_col,
-       "sl_min": sl_min, "speeder": speeder,
+       "sl_min": sl_min, "speeder": speeder, "this_date": this_date,
        "high_loi": high_loi if use_high else None}
 
 new["Factor"] = new.apply(
@@ -360,12 +434,17 @@ bad = new[new.Factor != ""].copy()
 bad["_sort"] = pd.to_numeric(bad.RespNum, errors="coerce")
 bad = bad.sort_values("_sort")
 
+report_rows = [{"id": r["_id"], "new": False, "src": "prev", "rec": r} for r in carried]
+report_rows += [{"id": r["RespNum"], "new": True, "src": "new", "rec": r}
+                for _, r in bad.iterrows()]
+report_rows.sort(key=lambda x: int(x["id"]) if str(x["id"]).isdigit() else 0)
+
 st.subheader("Result")
 c = st.columns(5)
 c[0].metric("Records", len(df))
-c[1].metric("Excluded (reported before)", len(prev))
-c[2].metric("Reviewed", len(new))
-c[3].metric("Bad IDs", len(bad))
+c[1].metric("Carried forward", len(carried))
+c[2].metric("New this round", len(bad))
+c[3].metric("Rows in report", len(report_rows))
 c[4].metric("Median LOI", f"{df.LOI.median():.2f}")
 
 counts = {
@@ -381,11 +460,14 @@ st.dataframe(pd.DataFrame([{"Criterion": k, "IDs": v} for k, v in counts.items()
 show = [c_ for c_ in ["RespNum", "Factor", "SL_count", "SL_which", "LOI",
                       ip_col, oe_col] if c_ in bad.columns or c_ == "RespNum"]
 st.dataframe(bad[show], hide_index=True, use_container_width=True)
+st.caption(f"{len(bad)} new IDs, shown above and marked red in the workbook. "
+           f"{len(carried)} carried forward from earlier rounds, "
+           f"{len(report_rows)} rows in total.")
 
-if len(bad):
+if len(report_rows):
     st.download_button(
         "Download report",
-        data=write_report(bad, chosen, cfg),
+        data=write_report(report_rows, chosen, cfg),
         file_name="Bad_IDs_Report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary")
